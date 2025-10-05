@@ -1,0 +1,194 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// Provide the token generation process info.
+#include <addons/TokenHelper.h>
+
+// Provide the RTDB payload printing info and other helper functions.
+#include <addons/RTDBHelper.h>
+
+/* 1. Define the WiFi credentials */
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+/* 2. Define the API Key */
+#define API_KEY ""
+
+/* 3. Define the RTDB URL */
+#define DATABASE_URL ""
+
+/* 4. Define the user Email and password that already registered or added in your project */
+#define USER_EMAIL ""
+#define USER_PASSWORD ""
+
+// Define Firebase Data object
+FirebaseData fbdo;
+
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long sendDataPrevMillis = 0;
+
+const int LED = 13;
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+const int TOUCH_SENSOR_PIN = 15;
+
+MPU6050 mpu;
+
+// Heart rate simulation variables
+int normalHeartRate = 85;  // Normal baseline for medium dog
+int dangerHeartRate = 165; // Dangerously high heart rate
+int currentBPM = normalHeartRate;
+int targetBPM = normalHeartRate;
+unsigned long lastHeartUpdate = 0;
+
+// Acceleration threshold
+float accelerationThreshold = 20000.0;  // Adjust this value as needed
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected with IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println();
+
+  Serial.printf("Firebase Client v%s\n\n", FIREBASE_CLIENT_VERSION);
+
+  /* Assign the api key (required) */
+  config.api_key = API_KEY;
+
+  /* Assign the user sign in credentials */
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  /* Assign the RTDB URL (required) */
+  config.database_url = DATABASE_URL;
+
+  /* Assign the callback function for the long running token generation task */
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectNetwork(true);
+
+  fbdo.setBSSLBufferSize(4096, 1024);
+
+  Firebase.begin(&config, &auth);
+
+  Firebase.setDoubleDigits(5);
+
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, LOW);
+  
+  pinMode(TOUCH_SENSOR_PIN, INPUT);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  mpu.initialize();
+
+  Serial.println(mpu.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+
+  delay(1000);
+  
+  Serial.println("=== Dog Health Monitor Ready ===");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Read touch sensor
+  int touchValue = digitalRead(TOUCH_SENSOR_PIN);
+  
+  // Touch sensor controls danger mode
+  bool dangerMode = (touchValue == 1);
+  
+  // Set LED based on danger mode
+  digitalWrite(LED, dangerMode ? HIGH : LOW);
+  
+  // Set target heart rate based on danger mode
+  if (dangerMode) {
+    targetBPM = dangerHeartRate;  // Danger: high heart rate
+  } else {
+    targetBPM = normalHeartRate;  // Normal: normal heart rate
+  }
+  
+  // Smoothly transition heart rate every 100ms
+  if (currentTime - lastHeartUpdate > 100) {
+    lastHeartUpdate = currentTime;
+    
+    // Gradually change heart rate to target
+    if (currentBPM < targetBPM) {
+      currentBPM += random(5, 10);  // Rapid increase when in danger
+      if (currentBPM > targetBPM) currentBPM = targetBPM;
+    } else if (currentBPM > targetBPM) {
+      currentBPM -= random(2, 5);  // Slow decrease when recovering
+      if (currentBPM < targetBPM) currentBPM = targetBPM;
+    }
+    
+    // Add slight natural variation (±3 BPM)
+    int variation = random(-3, 4);
+    int displayBPM = currentBPM + variation;
+    
+    // Keep within realistic bounds
+    if (displayBPM < 60) displayBPM = 60;
+    if (displayBPM > 180) displayBPM = 180;
+    
+    currentBPM = displayBPM;
+  }
+
+  // Send data to Firebase every 2 seconds
+  if (Firebase.ready() && (currentTime - sendDataPrevMillis > 2000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = currentTime;
+
+    // Read accelerometer values
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    // Calculate total acceleration
+    float totalAccel = sqrt(ax*ax + ay*ay + az*az);
+    
+    // Check if acceleration is above threshold (high activity)
+    bool highActivity = (totalAccel > accelerationThreshold);
+
+    Serial.println("=== Sending to Firebase ===");
+    Serial.print("Heart Rate: ");
+    Serial.print(currentBPM);
+    Serial.println(" BPM");
+    Serial.print("Danger Mode: ");
+    Serial.println(dangerMode ? "YES ⚠️" : "NO ✓");
+    Serial.print("High Activity: ");
+    Serial.println(highActivity ? "YES" : "NO");
+
+    // Send heart rate to Firebase
+    if (Firebase.setInt(fbdo, "/dogHealth/heartRate", currentBPM)) {
+      Serial.println("✓ Heart rate sent");
+    } else {
+      Serial.println("✗ Heart rate failed");
+    }
+
+    // Send danger mode boolean to Firebase
+    if (Firebase.setBool(fbdo, "/dogHealth/dangerMode", dangerMode)) {
+      Serial.println("✓ Danger mode sent");
+    } else {
+      Serial.println("✗ Danger mode failed");
+    }
+
+    // Send high activity boolean to Firebase
+    if (Firebase.setBool(fbdo, "/dogHealth/highActivity", highActivity)) {
+      Serial.println("✓ High activity status sent");
+    } else {
+      Serial.println("✗ High activity failed");
+    }
+
+    Serial.println("---");
+  }
+}
